@@ -2,9 +2,15 @@
 
 ### Turn WAV files into complementary color palettes using 1/3-octave bands and A/C/Z weighting
 
-### Usage
+### Requirements 
+- numpy
+- matplotlib
+- librosa (recommended) or soundfile
+
+### Examples
 ```
-python main.py input.wav --weighting A --base-mode centroid --out out
-# to out/palette_A.png, out/palette_A.json, out/palette_A.ase
+python audio2palette.py input.mp3 --weighting A --out out
+python audio2palette.py input.wav --plot-bands
+python audio2palette.py --demo
 ```
 
