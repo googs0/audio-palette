@@ -26,7 +26,7 @@ Requirements:
 # CONSTANTS
 EPS = 1e-20
 
-# ISO/IEC nominal 1/3-octave centers (25 Hz .. 20 kHz)
+# ISO/IEC nominal 1/3-octave centers (25 Hz - 20 kHz)
 THIRD_OCT_CENTER_HZ = np.array(
     [
         25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630,
@@ -37,7 +37,7 @@ THIRD_OCT_CENTER_HZ = np.array(
 )
 THIRD_OCT_EDGE_FACTOR = 2 ** (1 / 6)
 
-# Palette mapping “feel” constants
+# Palette mapping design constants
 HUE_ANALOG_SPREAD_DEG = 30.0
 TILT_MAX_SHIFT_DEG = 45.0
 MIN_SAT = 0.25
@@ -45,7 +45,16 @@ MAX_SAT = 0.95
 MIN_VAL = 0.55
 MAX_VAL = 0.98
 
-# AUDIO I/O HELPERS
+
+# PATH / OUTPUT HELPERS 
+def resolve_out_dir(p: str) -> str:
+    """Expand ~, make absolute, create dir if missing, and return path."""
+    out = os.path.abspath(os.path.expanduser(p))
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+# AUDIO I/O 
 def _to_float32_mono(y: np.ndarray, mono: bool = True) -> np.ndarray:
     # Ensure float32 mono in [-1, 1]
     y = np.asarray(y)
@@ -66,16 +75,14 @@ def load_audio(
     err = None
     if prefer in ("auto", "librosa"):
         try:
-            # type: ignore
-            import librosa
+            import librosa  # type: ignore
             y, sr = librosa.load(path, sr=None, mono=mono)
             return _to_float32_mono(y, mono=True), int(sr)
         except Exception as e:
             err = e
     if prefer in ("auto", "soundfile", "librosa"):
         try:
-            # type: ignore
-            import soundfile as sf
+            import soundfile as sf  # type: ignore
             y, sr = sf.read(path, dtype="float32", always_2d=False)
             return _to_float32_mono(y, mono=True), int(sr)
         except Exception as e:
@@ -95,7 +102,6 @@ def third_octave_band_edges(centers_hz: np.ndarray) -> np.ndarray:
     ).T
 
 # WEIGHTINGS
-# A-weighting
 def a_weighting_db(freq_hz: np.ndarray) -> np.ndarray:
     """IEC 61672 A-weighting (≈0 dB at 1 kHz)."""
     f2 = np.asarray(freq_hz, float) ** 2
@@ -104,7 +110,6 @@ def a_weighting_db(freq_hz: np.ndarray) -> np.ndarray:
     ra = num / (den + EPS)
     return 20.0 * np.log10(ra + EPS) + 2.0
 
-# C-weighting
 def c_weighting_db(freq_hz: np.ndarray) -> np.ndarray:
     """IEC 61672 C-weighting (≈0 dB at 1 kHz)."""
     f2 = np.asarray(freq_hz, float) ** 2
@@ -131,8 +136,10 @@ def compute_third_octave_levels(
     weighting: str = "A",
     band_centers_hz: np.ndarray = THIRD_OCT_CENTER_HZ,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    # Return (band_levels_db, band_centers_used_hz) for 1/3-octave bands with selected weighting
-    # Levels are relative (normalized to 0 dB peak)
+    """
+    Return (band_levels_db, band_centers_used_hz) for 1/3-octave bands with selected weighting.
+    Levels are relative (normalized to 0 dB peak).
+    """
     x = np.asarray(signal, np.float32)
     if x.size == 0:
         raise ValueError("Empty audio buffer.")
@@ -146,28 +153,34 @@ def compute_third_octave_levels(
     freqs_hz = np.fft.rfftfreq(n, d=1.0 / sample_rate)
     psd = (np.abs(spectrum) ** 2) / max(n, 1)
 
-    # Band edges in Nyquist
+    # Band edges within Nyquist
     edges = third_octave_band_edges(band_centers_hz)
     valid = edges[:, 1] < (sample_rate / 2.0)
     edges = edges[valid]
     centers_used_hz = band_centers_hz[valid]
 
+    # Vectorized bin to band assignment by upper-edge search
+    upper_edges = edges[:, 1]
+    band_idx = np.searchsorted(upper_edges, freqs_hz, side="left")
+    in_range = (band_idx < len(edges)) & (freqs_hz >= edges[np.clip(band_idx, 0, len(edges)-1), 0])
+
+    # Sum PSD per band with bincount
+    power_per_band = np.bincount(
+        band_idx[in_range],
+        weights=psd[in_range],
+        minlength=len(edges)
+    )
+
     # Apply weighting per band center
     w_db = get_weighting_db(centers_used_hz, weighting)
     w_lin = 10.0 ** (w_db / 10.0)
-
-    # Aggregate PSD per band
-    band_power = np.zeros(len(centers_used_hz), dtype=float)
-    for i, (f_lo, f_hi) in enumerate(edges):
-        mask = (freqs_hz >= f_lo) & (freqs_hz < f_hi)
-        band_power[i] = psd[mask].sum() * w_lin[i]
+    band_power = power_per_band * w_lin
 
     band_levels_db = 10.0 * np.log10(band_power + EPS)
-    # normalize to 0 dB peak
-    band_levels_db -= np.max(band_levels_db)
+    band_levels_db -= np.max(band_levels_db)  # normalize to 0 dB peak
     return band_levels_db, centers_used_hz
 
-# COLOR MAPPING
+# COLOR MAPPING 
 @dataclass
 class Palette:
     # (H°, S, V)
@@ -296,13 +309,13 @@ def palette_from_file(
     return palette_from_signal(y, sr, weighting=weighting, base_selector=base_selector)
 
 # CLI
-def _sine_mix(fs: int, dur: float, freqs: List[float], amps: Optional[List[float]] = None) -> np.ndarray:
+def synth_tone_mix(fs: int, dur: float, freqs: List[float], amps: Optional[List[float]] = None) -> np.ndarray:
+    """Simple sine mix generator with 10 ms cosine fades."""
     t = np.arange(int(fs * dur)) / fs
     amps = amps or [1.0] * len(freqs)
     sig = sum(a * np.sin(2 * np.pi * f * t) for f, a in zip(freqs, amps))
     sig /= max(np.max(np.abs(sig)), 1e-9)
-    # 10 ms fade
-    k = max(1, int(0.01 * fs))
+    k = max(1, int(0.01 * fs))  # 10 ms fade
     w = 0.5 * (1 - np.cos(np.linspace(0, np.pi, k)))
     sig[:k] *= w
     sig[-k:] *= w[::-1]
@@ -324,11 +337,14 @@ def main(argv=None):
     parser.add_argument("--demo", action="store_true", help="Use a built-in bass+treble signal.")
     args = parser.parse_args(argv)
 
-    os.makedirs(args.out, exist_ok=True)
+    # Normalize output directory and optionally auto-derive prefix from input
+    out_dir = resolve_out_dir(args.out)
+    if not args.demo and args.prefix == "palette" and args.input:
+        args.prefix = os.path.splitext(os.path.basename(args.input))[0]
 
     if args.demo:
         fs = 44100
-        sig = _sine_mix(fs, 2.5, [80, 3000], [0.9, 0.6])
+        sig = synth_tone_mix(fs, 2.5, [80, 3000], [0.9, 0.6])
         palette, band_levels_db, band_centers_hz = palette_from_signal(sig, fs, args.weighting, args.base_mode)
     else:
         if not args.input:
@@ -339,17 +355,17 @@ def main(argv=None):
 
     outputs = []
 
-    png_path = os.path.join(args.out, f"{args.prefix}_{args.weighting}.png")
+    png_path = os.path.join(out_dir, f"{args.prefix}_{args.weighting}.png")
     export_palette_png(palette, png_path, width_px=args.width, height_px=args.height)
     outputs.append(png_path)
 
     if not args.no_json:
-        json_path = os.path.join(args.out, f"{args.prefix}_{args.weighting}.json")
+        json_path = os.path.join(out_dir, f"{args.prefix}_{args.weighting}.json")
         export_palette_json(palette, json_path)
         outputs.append(json_path)
 
     if not args.no_ase:
-        ase_path = os.path.join(args.out, f"{args.prefix}_{args.weighting}.ase")
+        ase_path = os.path.join(out_dir, f"{args.prefix}_{args.weighting}.ase")
         export_palette_ase(palette, ase_path)
         outputs.append(ase_path)
 
@@ -362,7 +378,7 @@ def main(argv=None):
         ax.set_ylabel("Relative level (dB)")
         ax.grid(True, which="both", ls=":")
         ax.legend()
-        band_png = os.path.join(args.out, f"{args.prefix}_{args.weighting}_bands.png")
+        band_png = os.path.join(out_dir, f"{args.prefix}_{args.weighting}_bands.png")
         fig.tight_layout()
         fig.savefig(band_png, bbox_inches="tight")
         plt.close(fig)
