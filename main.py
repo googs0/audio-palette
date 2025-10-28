@@ -21,7 +21,6 @@ Requirements:
   - numpy
   - matplotlib
   - librosa (recommended) or soundfile
-
 """
 
 # CONSTANTS
